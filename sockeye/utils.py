@@ -25,7 +25,6 @@ import os
 import pprint
 import random
 import sys
-import time
 from collections import defaultdict
 from contextlib import contextmanager
 from itertools import starmap
@@ -819,28 +818,14 @@ def init_device(args: argparse.Namespace) -> pt.device:
 
     return device
 
-
-def fault_tolerant_symlink(src: str, dst: str, max_retries: int = 6):
-    """
-    Attempt to create a symbolic link from source to destination. If a
-    FileExistsError is raised, assume a distributed filesystem is currently
-    synchronizing, wait, and retry. If the maximum number of retries is
-    exceeded, raise an error.
-
-    :param src: Source file.
-    :param dst: Destination file.
-    :param max_retries: Maximum number of retries.
-    """
-    retries = 0
-    while True:
-        try:
-            os.symlink(src, dst)
-            return
-        except FileExistsError as error:
-            if retries >= max_retries:
-                break
-            wait_time = 2**retries
-            logger.warn(f'Error detected when calling symlink: {error}. Retrying in {wait_time} seconds.')
-            time.sleep(wait_time)
-            retries += 1
-    raise OSError(f'Max retries exceeded when attempting to create symlink: \'{src}\' -> \'{dst}\'')
+# Add by ZL
+def write_file(path,content):
+    file = open(path,'w',encoding="utf-8")
+    file.write(content)
+    file.close()
+    
+def read_file(path):
+    file = open(path,'r',encoding="utf-8")
+    content = file.readlines()
+    file.close()
+    return content

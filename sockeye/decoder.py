@@ -1,4 +1,4 @@
-# Copyright 2017--2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# Copyright 2017--2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"). You may not
 # use this file except in compliance with the License. A copy of the License
@@ -94,10 +94,6 @@ class Decoder(pt.nn.Module):
         super().__init__()
 
     @abstractmethod
-    def set_inference_only(self, inference_only: bool):
-        raise NotImplementedError()
-
-    @abstractmethod
     def state_structure(self) -> str:
         raise NotImplementedError()
 
@@ -151,6 +147,7 @@ class TransformerDecoder(Decoder):
         Decoder.__init__(self)
         pt.nn.Module.__init__(self)
         self.config = config
+        self.inference_only = inference_only
         self.pos_embedding = layers.PositionalEmbeddings(weight_type=self.config.positional_embedding_type,
                                                          num_embed=self.config.model_size,
                                                          max_seq_len=self.config.max_seq_len_target,
@@ -161,7 +158,7 @@ class TransformerDecoder(Decoder):
 
         self.layers = pt.nn.ModuleList(  # using ModuleList because we have additional inputs
             transformer.TransformerDecoderBlock(config,
-                                                inference_only=inference_only,
+                                                inference_only=self.inference_only,
                                                 dtype=dtype,
                                                 clamp_to_dtype=clamp_to_dtype)
             for _ in range(config.num_layers))
@@ -171,16 +168,8 @@ class TransformerDecoder(Decoder):
                                                                  num_hidden=self.config.model_size,
                                                                  dtype=dtype,
                                                                  clamp_to_dtype=clamp_to_dtype)
-        self.dropout = pt.nn.Dropout(p=self.config.dropout_prepost)
-        self.set_inference_only(inference_only)
-
-    def set_inference_only(self, inference_only: bool):
-        """
-        Set inference_only.
-        """
-        self.inference_only = inference_only
-        for layer in self.layers:
-            layer.set_inference_only(inference_only)
+        if self.config.dropout_prepost > 0.0:
+            self.dropout = pt.nn.Dropout(p=self.config.dropout_prepost, inplace=inference_only)
 
     def state_structure(self) -> str:
         """
@@ -290,7 +279,8 @@ class TransformerDecoder(Decoder):
         # (length, batch_size, model_size)
         target = target.transpose(1, 0)
 
-        target = self.dropout(target)
+        if self.config.dropout_prepost > 0.0:
+            target = self.dropout(target)
 
         new_autoregr_states = []  # type: List[pt.Tensor]
         for layer, layer_autoregr_state, layer_enc_att_kv in zip(self.layers, autoregr_states, enc_att_kv):

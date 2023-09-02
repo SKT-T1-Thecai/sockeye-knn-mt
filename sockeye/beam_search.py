@@ -82,10 +82,12 @@ class _SingleModelInference(_Inference):
     def decode_step(self,
                     step_input: pt.Tensor,
                     states: List,
+                    force_decode: bool=False,
                     vocab_slice_ids: Optional[pt.Tensor] = None,
                     target_prefix_factor_mask: Optional[pt.Tensor] = None,
                     factor_vocab_size: Optional[int] = None):
-        logits, knn_probs, states, target_factor_outputs = self._model.decode_step(step_input, states, vocab_slice_ids)
+
+        logits, knn_probs, states, target_factor_outputs, decoder_out = self._model.decode_step(step_input, states, vocab_slice_ids)
         if not self._skip_softmax:
             if knn_probs is None:  # no knn used
                 probs = pt.log_softmax(logits, dim=-1)
@@ -112,8 +114,10 @@ class _SingleModelInference(_Inference):
                 predictions.append(tf_prediction)
             # Shape: (batch*beam, num_secondary_factors, 2)
             target_factors = pt.cat(predictions, dim=1) if len(predictions) > 1 else predictions[0]
-
-        return scores, states, target_factors
+        if not force_decode:
+            return scores, states, target_factors
+        else:
+            return scores, states, target_factors, decoder_out
 
     @property
     def model_output_vocab_size(self):
@@ -656,6 +660,130 @@ class Search(pt.nn.Module):
     def log_search_stats(self):
         logger.debug(f'decoder softmax size: {self.output_vocab_sizes.mean:.1f} (avg)')
 
+# add by zl
+class ForceDecodeSearch(Search):
+    """
+    Force decode in a teacher enforcing manner.
+    """
+    def __init__(self,
+                 dtype: pt.dtype,
+                 bos_id: int,
+                 eos_id: int,
+                 device: pt.device,
+                 num_source_factors: int,
+                 num_target_factors: int,
+                 inference: _SingleModelInference,
+                 skip_nvs: bool = False,
+                 nvs_thresh: float = 0.5):
+        super().__init__(dtype, bos_id, eos_id, device, num_source_factors,
+                         num_target_factors, skip_nvs, nvs_thresh)
+        self.output_vocab_size = inference.model_output_vocab_size
+        self.output_factor_vocab_size = inference.model_output_factor_vocab_size
+        self._inference = inference
+        assert inference._skip_softmax, "skipping softmax must be enabled for GreedySearch"
+        self.work_block = GreedyTop1()
+
+    def forward(self,
+                source: pt.Tensor,
+                target: pt.Tensor,
+                source_length: pt.Tensor,
+                restrict_lexicon: Optional[lexicon.RestrictLexicon] = None,
+                max_output_lengths: pt.Tensor = None,
+                target_prefix: Optional[pt.Tensor] = None,
+                target_prefix_factors: Optional[pt.Tensor] = None) -> SearchResult:
+        
+        batch_size = source.size()[0]
+        assert batch_size == 1, "Force Search does not support batch_size != 1"
+
+        # Maximum  search iterations (determined by longest input with eos)
+        max_iterations = int(max_output_lengths.max().item())
+        logger.debug("max greedy search iterations: %d", max_iterations)
+
+        # best word_indices (also act as input: (batch*beam, num_target_factors
+        best_word_index = pt.full((batch_size, self.num_target_factors),
+                                  fill_value=self.bos_id, device=self.device, dtype=pt.int32)
+        outputs = []  # type: List[pt.Tensor]
+
+        # (0) encode source sentence, returns a list
+        model_states, _, nvs_prediction = self._inference.encode_and_initialize(source, source_length)
+        # TODO: check for disabled predicted output length
+
+        vocab_slice_ids = None  # type: Optional[pt.Tensor]
+        # If using a top-k lexicon or NVS select param rows for logit computation that correspond to the
+        # target vocab for this sentence.
+
+        output_vocab_size = self.output_vocab_size
+        if nvs_prediction is not None and not self.skip_nvs:
+            vocab_slice_ids, output_vocab_size = _get_nvs_vocab_slice_ids(self.nvs_thresh, nvs_prediction,
+                                                                          restrict_lexicon=restrict_lexicon,
+                                                                          target_prefix=target_prefix)
+        elif restrict_lexicon:
+            source_words = source[:, :, 0]
+            vocab_slice_ids, output_vocab_size = _get_vocab_slice_ids(restrict_lexicon, source_words,
+                                                                      self.eos_id, beam_size=1,
+                                                                      target_prefix=target_prefix,
+                                                                      output_vocab_size=self.output_vocab_size)
+        self.update_output_vocab_size(output_vocab_size)
+
+        # Prefix masks, where scores are infinity for all other vocabulary items except target_prefix ids
+        prefix_masks, prefix_masks_length = None, 0
+        if target_prefix is not None:
+            prefix_masks, prefix_masks_length = utils.gen_prefix_masking(target_prefix, self.output_vocab_size, self.dtype)
+            if vocab_slice_ids is not None:
+                prefix_masks = pt.index_select(prefix_masks, -1, vocab_slice_ids)
+        # Prefix factor masks, where scores are also infinity for all other factor items except target_prefix_factor ids
+        target_prefix_factor_masks, target_prefix_factor_length = None, 0
+        if target_prefix_factors is not None:
+            target_prefix_factor_masks, target_prefix_factor_length = utils.gen_prefix_masking(
+                target_prefix_factors, self.output_factor_vocab_size, self.dtype)
+
+        t = 1
+        hidden_states = None
+        for t in range(1, max_iterations + 1):
+            target_prefix_factor_mask = target_prefix_factor_masks[:, t-1] \
+                                        if target_prefix_factor_masks is not None and t <= target_prefix_factor_length \
+                                        else None
+            scores, model_states, target_factors, decoder_out = self._inference.decode_step(best_word_index,
+                                                                               model_states,
+                                                                               True,
+                                                                               vocab_slice_ids,
+                                                                               target_prefix_factor_mask,
+                                                                               self.output_factor_vocab_size)
+            
+            if t==1:
+                hidden_states = decoder_out
+            else:
+                hidden_states = pt.cat((hidden_states,decoder_out),dim=0)
+
+            if prefix_masks is not None and t <= prefix_masks_length:
+                # Make sure search selects the current prefix token
+                scores += prefix_masks[:, t-1]
+
+            # shape: (batch*beam=1, 1)
+            best_word_index = self.work_block(scores, vocab_slice_ids, target_factors)
+            # add by zl , manually change the decoder input .
+            if t <= target.shape[1]:      
+                best_word_index = pt.tensor(target[:,t-1,:]).to(self.device) 
+            outputs.append(best_word_index)
+            _best_word_index = best_word_index[:, 0]
+            if _best_word_index == self.eos_id or _best_word_index == C.PAD_ID or t>target.shape[1]:
+                break
+
+        logger.debug("Finished after %d out of %d steps.", t, max_iterations)
+
+        # shape: (1, num_factors, length)
+        stacked_outputs = pt.stack(outputs, dim=2)
+        length = pt.tensor([t], dtype=pt.int32)  # shape (1,)
+        hyp_indices = pt.zeros(1, t + 1, dtype=pt.int32)
+        # TODO: return unnormalized proper score
+        scores = pt.zeros(1, self.num_target_factors) - 1
+
+        return SearchResult(best_hyp_indices=hyp_indices,
+                            best_word_indices=stacked_outputs,
+                            accumulated_scores=scores,
+                            lengths=length,
+                            estimated_reference_lengths=None),hidden_states
+
 
 class GreedySearch(Search):
     """
@@ -884,6 +1012,9 @@ class BeamSearch(Search):
                 Shape: (batch_size, max prefix factors length, num_target_factors).
         :return SearchResult.
         """
+        # add by zl
+        print("开始beamsearch的forward")
+
         batch_size = source.size()[0]
         logger.debug("beam_search batch size: %d", batch_size)
 
@@ -893,7 +1024,7 @@ class BeamSearch(Search):
 
         # General data structure: batch_size * beam_size blocks in total;
         # a full beam for each sentence, followed by the next beam-block for the next sentence and so on
-
+        
         # best word_indices (also act as input: (batch*beam, num_target_factors
         best_word_indices = pt.full((batch_size * self.beam_size, self.num_target_factors),
                                     fill_value=self.bos_id, device=self.device, dtype=pt.int32)
@@ -984,6 +1115,10 @@ class BeamSearch(Search):
             target_prefix_factor_masks = target_prefix_factor_masks.unsqueeze(2).expand(-1, -1, self.beam_size, -1, -1)
 
         t = 1
+
+        # add by zl
+        print("开始beamsearch的搜索，最大搜索次数：{}".format(max_iterations))
+
         for t in range(1, max_iterations + 1):  # max_iterations + 1 required to get correct results
             # (1) obtain next predictions and advance models' state
             # target_dists: (batch_size * beam_size, target_vocab_size)
@@ -997,7 +1132,7 @@ class BeamSearch(Search):
                                                                                      vocab_slice_ids,
                                                                                      target_prefix_factor_mask,
                                                                                      self.output_factor_vocab_size)
-
+            
             # (2) Produces the accumulated cost of target words in each row.
             # There is special treatment for finished rows.
             # Finished rows are inf everywhere except column zero, which holds the accumulated model score
@@ -1104,9 +1239,11 @@ def get_search_algorithm(models: List[SockeyeModel],
                          prevent_unk: bool = False,
                          greedy: bool = False,
                          skip_nvs: bool = False,
-                         nvs_thresh: Optional[float] = None) -> Union[BeamSearch, GreedySearch]:
+                         nvs_thresh: Optional[float] = None,
+                         force_decode: bool = False) -> Union[BeamSearch, GreedySearch]:
     """
     Returns an instance of BeamSearch or GreedySearch depending.
+    Add by zl: it can also return a ForceDecodeSearch object.
 
     """
     # TODO: consider automatically selecting GreedySearch if flags to this method are compatible.
@@ -1132,6 +1269,29 @@ def get_search_algorithm(models: List[SockeyeModel],
                                             knn_lambda=knn_lambda),
             skip_nvs=skip_nvs,
             nvs_thresh=nvs_thresh)
+    # add by zl
+    elif force_decode:
+        assert len(models) == 1, "Force decode search does not support ensemble decoding"
+        assert beam_size == 1,"Force decode search does not support beam_size > 1"
+        if output_scores:
+            logger.warning("Force decode Search does not return proper hypothesis scores")
+        assert constant_length_ratio == -1.0, "Force decode search does not support brevity penalty"
+        assert sample is None, "Force decode search does not support sampling"
+        assert not prevent_unk, "Force decode search does not support prevention of unknown tokens"
+        search = ForceDecodeSearch(
+        dtype=models[0].dtype,
+        bos_id=C.BOS_ID,
+        eos_id=C.EOS_ID,
+        device=device,
+        num_source_factors=models[0].num_source_factors,
+        num_target_factors=models[0].num_target_factors,
+        inference=_SingleModelInference(model=models[0],
+                                        skip_softmax=True,
+                                        constant_length_ratio=0.0,
+                                        knn_lambda=knn_lambda),
+        skip_nvs=skip_nvs,
+        nvs_thresh=nvs_thresh)
+
     else:
         inference = None  # type: Optional[_Inference]
         if len(models) == 1:

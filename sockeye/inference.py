@@ -1,4 +1,4 @@
-# Copyright 2017--2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# Copyright 2017--2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"). You may not
 # use this file except in compliance with the License. A copy of the License
@@ -768,6 +768,7 @@ class Translator:
                  max_output_length: Optional[int] = None,
                  prevent_unk: bool = False,
                  greedy: bool = False,
+                 force_decode: bool = False,
                  skip_nvs: bool = False,
                  nvs_thresh: float = 0.5) -> None:
         self.device = device
@@ -778,6 +779,7 @@ class Translator:
         self.beam_search_stop = beam_search_stop
         self.source_vocabs = source_vocabs
         self.vocab_targets = target_vocabs
+        self.force_decode = force_decode
         self.vocab_targets_inv = [vocab.reverse_vocab(v) for v in self.vocab_targets]
         self.restrict_lexicon = restrict_lexicon
         assert C.PAD_ID == 0, "pad id should be 0"
@@ -787,8 +789,6 @@ class Translator:
         if strip_unknown_words:
             self.strip_ids.add(self.unk_id)
         self.models = models
-        for model in self.models:
-            model.eval()
 
         # after models are loaded we ensured that they agree on max_input_length, max_output_length and batch size
         # set a common max_output length for all models.
@@ -818,7 +818,8 @@ class Translator:
             prevent_unk=prevent_unk,
             greedy=greedy,
             skip_nvs=skip_nvs,
-            nvs_thresh=nvs_thresh)
+            nvs_thresh=nvs_thresh,
+            force_decode=force_decode)
 
         self._concat_translations = partial(_concat_nbest_translations if self.nbest_size > 1 else _concat_translations,
                                             stop_ids=self.stop_ids,
@@ -863,8 +864,10 @@ class Translator:
     @property
     def eop_id(self) -> int:
         return self.models[0].eop_id
-
-    def translate(self, trans_inputs: List[TranslatorInput], fill_up_batches: bool = True) -> List[TranslatorOutput]:
+    
+    def translate(self, trans_inputs: List[TranslatorInput], 
+                  expected_outputs: Optional[List[str]] = None,
+                  fill_up_batches: bool = True) -> List[TranslatorOutput]:
         """
         Batch-translates a list of TranslatorInputs, returns a list of TranslatorOutputs.
         Empty or bad inputs are skipped.
@@ -878,11 +881,13 @@ class Translator:
         :param fill_up_batches: If True, underfilled batches are padded to Translator.max_batch_size.
         :return: List of translation results.
         """
+
         num_inputs = len(trans_inputs)
         translated_chunks = []  # type: List[IndexedTranslation]
 
         # split into chunks
         input_chunks = []  # type: List[IndexedTranslatorInput]
+
         for trans_input_idx, trans_input in enumerate(trans_inputs):
             # bad input
             if isinstance(trans_input, BadTranslatorInput):
@@ -928,14 +933,17 @@ class Translator:
                             "constraint" if len(trans_input.constraints) == 1 else "constraints",
                             ", ".join(" ".join(x) for x in trans_input.constraints))
 
+
         num_bad_empty = len(translated_chunks)
 
         # Sort longest to shortest (to rather fill batches of shorter than longer sequences)
-        input_chunks = sorted(input_chunks, key=lambda chunk: len(chunk.translator_input.tokens), reverse=True)
+        if not self.force_decode:
+            input_chunks = sorted(input_chunks, key=lambda chunk: len(chunk.translator_input.tokens), reverse=True)
         # translate in batch-sized blocks over input chunks
         batch_size = self.max_batch_size if fill_up_batches else min(len(input_chunks), self.max_batch_size)
 
         num_batches = 0
+        all_hidden_states = []
         for batch_id, batch in enumerate(utils.grouper(input_chunks, batch_size)):
             logger.debug("Translating batch %d", batch_id)
 
@@ -945,7 +953,14 @@ class Translator:
                 batch = batch + [batch[0]] * rest
 
             translator_inputs = [indexed_translator_input.translator_input for indexed_translator_input in batch]
-            batch_translations = self._translate_batch(translator_inputs)
+            with pt.inference_mode():
+                # add by zl
+                if self.force_decode:
+                    batch_translations,hidden_states = self._translate_force(
+                        *self._get_force_decode_input(translator_inputs,expected_outputs[batch_id*batch_size:batch_id*batch_size+batch_size]))
+                    all_hidden_states.append(hidden_states)
+                else:
+                    batch_translations = self._translate_np(*self._get_inference_input(translator_inputs))
 
             # truncate to remove filler translations
             if fill_up_batches and rest > 0:
@@ -986,18 +1001,75 @@ class Translator:
         logger.debug("Translated %d inputs (%d chunks) in %d batches to %d outputs. %d empty/bad inputs.",
                      num_inputs, num_chunks, num_batches, num_outputs, num_bad_empty)
         self._search.log_search_stats()
+        if self.force_decode:
+            return results, all_hidden_states
+        else:
+            return results
+    
+    # add by zl
+    def _get_force_decode_input(self,
+                                trans_inputs: List[TranslatorInput],
+                                trans_outputs:List[str])->Tuple[pt.Tensor,
+                                                                           pt.Tensor,
+                                                                           Optional[lexicon.RestrictLexicon],
+                                                                           pt.Tensor,
+                                                                           Optional[pt.Tensor],
+                                                                           Optional[pt.Tensor]]:
+        batch_size = len(trans_inputs)
 
-        return results
+        max_target_prefix_length = max(inp.num_target_prefix_tokens for inp in trans_inputs)
+        max_target_prefix_factors_length = max(inp.num_target_prefix_factors for inp in trans_inputs)
+        max_length = max(len(inp) for inp in trans_inputs)
+        # assembling source ids on cpu array (faster) and copy to Translator.device (potentially GPU) in one go below.
+        source_np = np.zeros((batch_size, max_length, self.num_source_factors), dtype='int32')
+        target_np = np.zeros((batch_size, max_length, self.num_target_factors), dtype='int32')
+        # total token length and prepended token length
+        length_np = np.zeros((batch_size, 2), dtype='int32')
 
-    def _translate_batch(self, translator_inputs: List[TranslatorInput]) -> List[Translation]:
-        """
-        Translate a batch of inputs.
+        target_prefix_np = np.zeros((batch_size, max_target_prefix_length), dtype='int32') \
+            if max_target_prefix_length > 0 else None
+        target_prefix_factors_np = np.zeros((batch_size, max_target_prefix_factors_length,
+                                             self.num_target_factors - 1), dtype='int32') \
+            if self.num_target_factors > 1 and max_target_prefix_factors_length > 0 else None
+        restrict_lexicon = None  # type: Optional[lexicon.RestrictLexicon]
 
-        :param translator_inputs: List of TranslatorInputs.
-        :return: List of Translation.
-        """
-        with pt.inference_mode():
-            return self._translate_np(*self._get_inference_input(translator_inputs))
+        max_output_lengths = []  # type: List[int]
+        for j, trans_input in enumerate(trans_inputs):
+            trans_output = trans_outputs[j]
+            num_tokens = len(trans_input)  # includes eos
+            primary_source_ids = tokens2ids(itertools.chain(trans_input.get_source_prefix_tokens(),
+                                                            trans_input.tokens), self.source_vocabs[0])
+            primary_target_ids = tokens2ids(itertools.chain([],trans_output.split(" ")),self.vocab_targets[0])
+            source_np[j, :num_tokens, 0] = primary_source_ids
+            target_np[j, :len(trans_output.split(" ")), 0] = primary_target_ids
+            length_np[j, 0] = num_tokens
+            length_np[j, 1] = get_prepended_token_length(primary_source_ids, self.eop_id)
+            # the effective source length excludes prepended tokens
+            max_output_lengths.append(self._get_max_output_length(length_np[j, 0] - length_np[j, 1]))
+       
+            factors = trans_input.factors if trans_input.factors is not None else []
+            num_factors = 1 + len(factors)
+
+        source = pt.tensor(source_np, device=self.device, dtype=pt.int32)
+        target = pt.tensor(target_np, device=self.device, dtype=pt.int32)
+        source_length = pt.tensor(length_np, device=self.device, dtype=pt.int32)  # shape: (batch_size, 2)
+        max_out_lengths = pt.tensor(max_output_lengths, device=self.device, dtype=pt.int32)
+        target_prefix = pt.tensor(target_prefix_np, device=self.device, dtype=pt.int32) \
+            if target_prefix_np is not None else None
+        target_prefix_factors = pt.tensor(target_prefix_factors_np, device=self.device, dtype=pt.int32) \
+            if target_prefix_factors_np is not None else None
+
+        # During inference, if C.TARGET_FACTOR_SHIFT is True, predicted target_factors are left-shifted
+        # (see _unshift_target_factors function()) so that they re-align with the words.
+        # With that, target_prefix_factors need to be also right-shifted here if C.TARGET_FACTOR_SHIFT is True so
+        # that when they are shifted back later they would align with words.
+        target_prefix_factors = utils.shift_prefix_factors(target_prefix_factors) \
+            if target_prefix_factors is not None and \
+               C.TARGET_FACTOR_SHIFT else target_prefix_factors
+
+        return source, target, source_length, restrict_lexicon, max_out_lengths, target_prefix, target_prefix_factors
+
+
 
     def _get_inference_input(self,
                              trans_inputs: List[TranslatorInput]) -> Tuple[pt.Tensor,
@@ -1181,6 +1253,24 @@ class Translator:
                                 nbest_factor_translations=nbest_factor_translations,
                                 nbest_factor_tokens=nbest_factor_tokens)
 
+    def _translate_force(self,
+                      source: pt.Tensor,
+                      target: Optional[pt.tensor],
+                      source_length: pt.Tensor,
+                      restrict_lexicon: Optional[lexicon.RestrictLexicon],
+                      max_output_lengths: pt.Tensor,
+                      target_prefix: Optional[pt.Tensor] = None,
+                      target_prefix_factors: Optional[pt.Tensor] = None) -> List[Translation]:
+        search_result, hidden_states = self._search(source,
+                                                    target,
+                                                    source_length,
+                                                    restrict_lexicon,
+                                                    max_output_lengths,
+                                                    target_prefix,
+                                                    target_prefix_factors)
+        return self._get_best_translations(search_result),hidden_states
+        
+
     def _translate_np(self,
                       source: pt.Tensor,
                       source_length: pt.Tensor,
@@ -1207,6 +1297,7 @@ class Translator:
                                                         max_output_lengths,
                                                         target_prefix,
                                                         target_prefix_factors))
+
 
     def _get_best_translations(self, result: SearchResult) -> List[Translation]:
         """
